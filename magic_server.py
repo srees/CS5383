@@ -1,5 +1,5 @@
-import socket
 import random
+from more_reliable_UDP import RDTOverUDP
 
 # Define server address and port
 HOST = "0.0.0.0"  # Listen on all available network interfaces
@@ -29,26 +29,26 @@ MAGIC_8_BALL_RESPONSES = [
     "Maybe, maybe not."
 ]
 
-# Create a UDP socket
-udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-# Bind the socket to the address and port
-udp_socket.bind((HOST, PORT))
+# Setup reliable data transfer connection
+rdtConnect = RDTOverUDP(HOST, PORT)
 
 print(f"Magic 8-Ball UDP server listening on {HOST}:{PORT}")
-
+rdtConnect.rdt_server_wait_connect()
 while True:
+    # As we are looping, if the client has called close we need to reopen for connections again
+    if rdtConnect.state == rdtConnect.STATE_CLOSED:
+        rdtConnect.rdt_server_wait_connect()
     # Receive data from client (buffer size = 1024 bytes)
-    data, client_address = udp_socket.recvfrom(1024)
+    data = rdtConnect.rdt_receive()
+    if data:
+        question = data.decode().strip()
 
-    question = data.decode().strip()
+        # Pick a random Magic 8-Ball response
+        response = random.choice(MAGIC_8_BALL_RESPONSES)
 
-    # Pick a random Magic 8-Ball response
-    response = random.choice(MAGIC_8_BALL_RESPONSES)
+        # Log the interaction
+        print(f"Received question: '{question}' from {rdtConnect.client_address}")
+        print(f"Magic 8-Ball response: '{response}'\n")
 
-    # Log the interaction
-    print(f"Received question: '{question}' from {client_address}")
-    print(f"Magic 8-Ball response: '{response}'\n")
-
-    # Send the response back to the client
-    udp_socket.sendto(response.encode(), client_address)
+        # Send our response over our reliable data transfer object
+        packet = rdtConnect.rdt_send(response.encode())

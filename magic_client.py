@@ -1,11 +1,8 @@
-import socket
+from more_reliable_UDP import RDTOverUDP
 
 # Server details
 SERVER_IP = "127.0.0.1"  # Change to the actual server IP if running remotely
 SERVER_PORT = 12345
-
-# Create UDP socket
-udp_client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 print("Welcome to the Magic 8-Ball! Type your question and press Enter.")
 print("Type 'exit' to quit.\n")
@@ -18,12 +15,16 @@ while True:
         print("Goodbye!")
         break
 
+    # Setup reliable data transfer connection
+    rdtConnect = RDTOverUDP(SERVER_IP, SERVER_PORT)
+
     # Send question to server
-    udp_client.sendto(question.encode(), (SERVER_IP, SERVER_PORT))
+    rdtConnect.rdt_client_connect()
+    rdtConnect.rdt_send(question.encode())
 
     # Receive response
-    response, server_address = udp_client.recvfrom(1024)
+    response = rdtConnect.rdt_receive()
     print(f"Magic 8-Ball says: {response.decode()}\n")
 
-# Close the socket when done
-udp_client.close()
+    # Close the socket when done (though we loopin'!)
+    rdtConnect.close()
