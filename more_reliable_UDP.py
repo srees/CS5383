@@ -2,6 +2,8 @@ import struct
 import socket
 from random import random
 
+from math import floor
+
 
 # Class for managing reliable data transfer over UDP
 # This is a basic form of reliability for a class homework assignment
@@ -50,13 +52,12 @@ class RDTOverUDP:
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.set_state(self.STATE_INIT)
+        self.state = self.STATE_INIT
         self.seq_num = 0 # Holds local sequence number
         self.ack_num = 0 # Holds remote sequence number +1
-        self.final = False
+        self.final = 0
         self.udp_socket = None
         self.client_address = host
-        self.awaiting_ack = False
         self.cached_packet = None
 
     #################################################################
@@ -102,7 +103,7 @@ class RDTOverUDP:
                 elif self.state == self.STATE_SYNACK_SENT:
                     if packet_type == self.PACKET_TYPE_ACK and ack_num == self.seq_num + 1:
                         self.set_state(self.STATE_ESTABLISHED)
-                        self.ack_num = 1 # This is intentional to request the first set of data
+                        self.ack_num = seq_num + 1
                         # No response necessary
                     # Anything else is unexpected, return a RESET
                     else:
@@ -141,7 +142,7 @@ class RDTOverUDP:
                     self.ack_num = seq_num + 1
                     self.rdt_send_packet(self.PACKET_TYPE_ACK, b"")
                     self.set_state(self.STATE_ESTABLISHED)
-                    self.seq_num = 0 # intentional for tracking data from the first segment
+                    #self.seq_num = 0 # intentional for tracking data from the first segment
                 elif packet_type == self.PACKET_TYPE_RESET:
                     self.do_reset()
                 else:
@@ -166,6 +167,7 @@ class RDTOverUDP:
 
     # The reliable receive function handles FSM states from ESTABLISHED to CLOSED
     def rdt_receive(self):
+        print('Listening for data')
         # We should already have an established connection
         data_complete = False
         buffer = b''
@@ -182,14 +184,14 @@ class RDTOverUDP:
                 if packet_type == self.PACKET_TYPE_DATA:
                     # If the sequence number is correct, increment what we expect
                     if seq_num == self.ack_num:
-                        self.ack_num += 1
+                        self.ack_num = seq_num + 1
                         # Buffer the data
                         buffer += payload
-                        # Send ack (this will be a re-ack for the previous packet if the numbers don't match)
-                        self.rdt_send_packet(self.PACKET_TYPE_ACK, b"")
                         # Set variable to break out of while loop and return data to caller
                         if final == self.FINAL_FLAG:
-                            self.final = True
+                            self.final = 1
+                        # Send ack (this will be a re-ack for the previous packet if the numbers don't match)
+                        self.rdt_send_packet(self.PACKET_TYPE_ACK, b"", final=self.final)
                     else:
                         # If the seq is wrong, our ack may have timed out - resend
                         self.rdt_send_packet(self.PACKET_TYPE_ACK, b"",resend=True)
@@ -206,6 +208,8 @@ class RDTOverUDP:
                     self.udp_socket.close()
                 elif packet_type == self.PACKET_TYPE_RESET:
                     self.do_reset()
+                elif packet_type == self.PACKET_TYPE_ACK:
+                    continue
                 # Anything else is either unexpected or a reset
                 else:
                     self.rdt_send_packet(self.PACKET_TYPE_RESET, b"")
@@ -234,6 +238,7 @@ class RDTOverUDP:
 
     # The reliable send function handles FSM states from ESTABLISHED to CLOSED
     def rdt_send(self, payload):
+        print('Sending data...')
         # Split the payload into smaller packets if necessary
         packets = self.split_payload(payload)
         sent = 0
@@ -244,7 +249,7 @@ class RDTOverUDP:
                 # Send the packet
                 if sent == len(packets) - 1:
                     self.rdt_send_packet(self.PACKET_TYPE_DATA, packets[sent], self.FINAL_FLAG, resend=resend)
-                    self.final = True
+                    self.final = 1
                 else:
                     self.rdt_send_packet(self.PACKET_TYPE_DATA, packets[sent], resend=resend)
                 # Wait for the ACK - The TIMEOUT parameter is used for triggering a resend on dropped packets
@@ -260,6 +265,7 @@ class RDTOverUDP:
                         # Good ack, increment to next packet
                         resend = False
                         sent += 1
+                        self.ack_num = seq_num + 1
                         # If that was the last packet, reset ack/seq values - an unnecessary choice on my part
                         if self.final:
                             self.do_reset()
@@ -267,13 +273,12 @@ class RDTOverUDP:
                         # resend on out-of-order packets
                         print(f"Received ack:{ack_num}, but expected {self.seq_num + 1} -- resending")
                         resend = True
-                #elif packet_type == self.PACKET_TYPE_DATA:
-                    # This is an unusual case that comes up if the other end sent us a final data packet last and our ack
-                    # to them was lost. We proceed to send our response data and get back a resend of the last final packet
-                    # instead of the ack we expect. So let's just give them an ack on it again and retry our send.
-                    #if not self.awaiting_ack:
-                    #    self.rdt_send_packet(self.PACKET_TYPE_ACK, b"", seq_num=seq_num+1, ack_num=seq_num+1)
-                    #resend = True
+                elif packet_type == self.PACKET_TYPE_DATA:
+                    print(f"self ack: {self.ack_num} seq: {seq_num}")
+                    if self.ack_num == (seq_num + 1):
+                        # We have already seen this, ack it
+                        self.rdt_send_packet(self.PACKET_TYPE_ACK, b"", ack_num=self.ack_num, seq_num=seq_num)
+                        resend = True
             else:
                 # Auto-reconnect
                 self.rdt_client_connect()
@@ -282,11 +287,11 @@ class RDTOverUDP:
     def rdt_send_packet(self, packet_type, payload, final=0, resend=False, seq_num=None, ack_num=None):
         # The only time we override seq_num and ack_num are for a special case where we are just giving a blanket re-ack
         # for a packet we already moved past
-        # if seq_num is not None and ack_num is not None:
-        #     header = struct.pack(self.HEADER_FORMAT, packet_type, seq_num, ack_num, final)
-        #     packet = header + payload
-        #     self.send_packet(packet, dropchance=packet_type in (self.PACKET_TYPE_DATA, self.PACKET_TYPE_ACK))
-        #     return
+        if seq_num is not None and ack_num is not None:
+             header = struct.pack(self.HEADER_FORMAT, packet_type, seq_num, ack_num, final)
+             packet = header + payload
+             self.send_packet(packet, dropchance=packet_type in (self.PACKET_TYPE_DATA, self.PACKET_TYPE_ACK))
+             return
         if resend:
             # Resend the cached packet
             packet = self.cached_packet
@@ -304,15 +309,14 @@ class RDTOverUDP:
             # Cache the packet
             self.cached_packet = packet
 
-        #self.send_packet(packet, dropchance=packet_type in (self.PACKET_TYPE_DATA, self.PACKET_TYPE_ACK))
-        self.send_packet(packet, dropchance=(packet_type==self.PACKET_TYPE_DATA))
+        self.send_packet(packet, dropchance=packet_type in (self.PACKET_TYPE_DATA, self.PACKET_TYPE_ACK))
+        #self.send_packet(packet, dropchance=(packet_type==self.PACKET_TYPE_DATA))
 
     #########################################################
     ##### These are the underlying unreliable functions #####
     #########################################################
 
     # Receive packet, used by either server or client
-    # TODO refactor this to move the added header layer into the reliable send function for separation of concerns
     def wait_for_packet(self, timeout=None):
         # Receive packet
         try:
@@ -326,10 +330,9 @@ class RDTOverUDP:
             return None
 
     # Send packet, used by either server or client
-    # TODO refactor this to move the caching and added header layer into the reliable send function for separation of concerns
     def send_packet(self, packet, dropchance = False):
         # Add unreliability for testing :evil:
-        if dropchance and random() < self.DROP_CHANCE:
+        if dropchance and floor(random()*1000000)%10 < self.DROP_CHANCE*10:
             print(f"(Dropped send)")
             return
         else:
@@ -358,6 +361,6 @@ class RDTOverUDP:
 
     # This is not truly needed, but I opted to reset these header fields when a message is completed
     def do_reset(self):
-        self.seq_num = 0
-        self.ack_num = 1
-        self.final = False
+        #self.seq_num = 0
+        #self.ack_num = 1
+        self.final = 0
