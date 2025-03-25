@@ -31,18 +31,21 @@ MAGIC_8_BALL_RESPONSES = [
 
 # Setup reliable data transfer connection
 rdtConnect = RDTOverUDP(HOST, PORT)
-
-print(f"Magic 8-Ball UDP server listening on {HOST}:{PORT}")
 rdtConnect.rdt_server_wait_connect()
+print(f"Magic 8-Ball UDP server listening on {HOST}:{PORT}")
+
+#Listen until exited
 while True:
-    # As we are looping, if the client has called close we need to reopen for connections again
+    # I designed this so that if the client exits cleanly, the server will
+    # detect and reinitialize for another connection
     if rdtConnect.state == rdtConnect.STATE_CLOSED:
-        break
+        rdtConnect.rdt_server_wait_connect()
     # Receive data from client (buffer size = 1024 bytes)
     data = rdtConnect.rdt_receive()
     if data:
         question = data.decode().strip()
-
+        # The client can also request to kill the server
+        # which ends it for both of them.
         if question.lower() == "kill":
             print("Server shutting down...")
             rdtConnect.close()

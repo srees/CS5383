@@ -9,14 +9,14 @@ print("Type 'exit' to quit.\n")
 
 # Setup reliable data transfer connection
 rdtConnect = RDTOverUDP(SERVER_IP, SERVER_PORT)
-
-# Send question to server
 rdtConnect.rdt_client_connect()
 
+# Loop until exited
 while True:
     # Get user input
     question = input("Ask the Magic 8-Ball a question: ").strip()
 
+    # Close connection and quit
     if question.lower() == "exit":
         print("Goodbye!")
         rdtConnect.close()
@@ -27,6 +27,7 @@ while True:
 
     # Receive response
     response = rdtConnect.rdt_receive()
+    # Detect remote close
     if rdtConnect.state == rdtConnect.STATE_CLOSED:
         break
     print(f"Magic 8-Ball says: {response.decode()}\n")
