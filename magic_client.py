@@ -7,24 +7,27 @@ SERVER_PORT = 12345
 print("Welcome to the Magic 8-Ball! Type your question and press Enter.")
 print("Type 'exit' to quit.\n")
 
+# Setup reliable data transfer connection
+rdtConnect = RDTOverUDP(SERVER_IP, SERVER_PORT)
+
+# Send question to server
+rdtConnect.rdt_client_connect()
+
 while True:
     # Get user input
     question = input("Ask the Magic 8-Ball a question: ").strip()
 
     if question.lower() == "exit":
         print("Goodbye!")
+        rdtConnect.close()
         break
 
-    # Setup reliable data transfer connection
-    rdtConnect = RDTOverUDP(SERVER_IP, SERVER_PORT)
-
     # Send question to server
-    rdtConnect.rdt_client_connect()
     rdtConnect.rdt_send(question.encode())
 
     # Receive response
     response = rdtConnect.rdt_receive()
+    if rdtConnect.state == rdtConnect.STATE_CLOSED:
+        break
     print(f"Magic 8-Ball says: {response.decode()}\n")
 
-    # Close the socket when done (though we loopin'!)
-    rdtConnect.close()

@@ -37,11 +37,16 @@ rdtConnect.rdt_server_wait_connect()
 while True:
     # As we are looping, if the client has called close we need to reopen for connections again
     if rdtConnect.state == rdtConnect.STATE_CLOSED:
-        rdtConnect.rdt_server_wait_connect()
+        break
     # Receive data from client (buffer size = 1024 bytes)
     data = rdtConnect.rdt_receive()
     if data:
         question = data.decode().strip()
+
+        if question.lower() == "kill":
+            print("Server shutting down...")
+            rdtConnect.close()
+            break
 
         # Pick a random Magic 8-Ball response
         response = random.choice(MAGIC_8_BALL_RESPONSES)

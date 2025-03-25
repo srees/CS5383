@@ -1,5 +1,7 @@
 import struct
 import socket
+from random import random
+
 
 # Class for managing reliable data transfer over UDP
 # This is a basic form of reliability for a class homework assignment
@@ -12,6 +14,7 @@ class RDTOverUDP:
     PACKET_TYPE_DISCONNECT_ACK = 0x05
     PACKET_TYPE_DATA = 0x06
     PACKET_TYPE_RESET = 0x07
+    PACKET_TYPE_NONE = 0xFF
 
     MORE_FLAG = 0x00
     FINAL_FLAG = 0x01
@@ -32,20 +35,26 @@ class RDTOverUDP:
     STATE_CLOSING = "CLOSING"
     STATE_CLOSED = "CLOSED"
 
+    # Constants
+    HEADER_FORMAT = "!BIIB"
+    HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+    CONNECT_RETRY = 3
+    UDP_BUFFER = 1024
+    SEND_BYTE_SIZE = 8
+    TIMEOUT = 1.0
+    DROP_CHANCE = 0.3
+
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.header_format = "!BIIB"
-        self.header_size = struct.calcsize(self.header_format)
         self.set_state(self.STATE_INIT)
         self.seq_num = 0 # Holds local sequence number
         self.ack_num = 0 # Holds remote sequence number +1
         self.final = False
         self.udp_socket = None
         self.client_address = host
-        self.connect_retry = 3
-        self.udp_buffer = 1024
-        self.send_byte_size = 8
+        self.awaiting_ack = False
+        self.cached_packet = None
 
     def set_state(self, state):
         self.state = state
@@ -56,25 +65,30 @@ class RDTOverUDP:
         self.ack_num = 1
         self.final = False
 
-    def wait_for_packet(self):
+    def wait_for_packet(self, timeout=None):
         # Receive packet
-        data, client_address = self.udp_socket.recvfrom(self.udp_buffer)
-        # Store client address
-        self.client_address = client_address
+        try:
+            self.udp_socket.settimeout(timeout)
+            data, client_address = self.udp_socket.recvfrom(self.UDP_BUFFER)
+            self.udp_socket.settimeout(None)
+            # Store client address
+            self.client_address = client_address
 
-        # Split out and parse header
-        header = data[:self.header_size]
-        payload = data[self.header_size:]
-        packet_type, seq_num, ack_num, final = struct.unpack(self.header_format, header)
-        print(f"Received packet type {packet_type} with sequence {seq_num}, ack {ack_num}, final {final}, payload '{payload.decode()}'")
-        return packet_type, seq_num, ack_num, final, payload
+            # Split out and parse header
+            header = data[:self.HEADER_SIZE]
+            payload = data[self.HEADER_SIZE:]
+            packet_type, seq_num, ack_num, final = struct.unpack(self.HEADER_FORMAT, header)
+            print(f"Received packet type {packet_type} with sequence {seq_num}, ack {ack_num}, final {final}, payload '{payload.decode()}'")
+            return packet_type, seq_num, ack_num, final, payload
+        except socket.timeout:
+            return self.PACKET_TYPE_NONE, 0, 0, 0, b""
 
     def rdt_server_wait_connect(self):
         retries = 0
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_socket.bind((self.host, self.port))
         self.set_state(self.STATE_LISTEN)
-        while not self.state == self.STATE_ESTABLISHED and not retries == self.connect_retry:
+        while not self.state == self.STATE_ESTABLISHED and not retries == self.CONNECT_RETRY:
             # Get packet
             packet_type, seq_num, ack_num, final, payload = self.wait_for_packet()
 
@@ -109,7 +123,7 @@ class RDTOverUDP:
                     self.do_reset()
                     self.set_state(self.STATE_LISTEN)
                     retries += 1
-        if retries == self.connect_retry:
+        if retries == self.CONNECT_RETRY:
             self.set_state(self.STATE_CLOSED)
             print(f"Failed to connect - connect retry limit reached")
 
@@ -139,7 +153,8 @@ class RDTOverUDP:
                         if final == self.FINAL_FLAG:
                             self.final = True
                     else:
-                        self.send_packet(self.PACKET_TYPE_ACK, b"",no_increment=True)
+                        # If the seq is wrong, our ack may have timed out - resend
+                        self.send_packet(self.PACKET_TYPE_ACK, b"",resend=True)
                 # Handle disconnect
                 elif packet_type == self.PACKET_TYPE_DISCONNECT:
                     self.set_state(self.STATE_CLOSE_WAIT)
@@ -166,10 +181,10 @@ class RDTOverUDP:
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.set_state(self.STATE_INIT)
         retries = 0
-        while not self.state == self.STATE_ESTABLISHED and not retries == self.connect_retry:
+        while not self.state == self.STATE_ESTABLISHED and not retries == self.CONNECT_RETRY:
             # Send options
             if self.state == self.STATE_INIT:
-                self.send_packet(self.PACKET_TYPE_CONNECT, b"", use_tuple=True)
+                self.send_packet(self.PACKET_TYPE_CONNECT, b"")
                 self.set_state(self.STATE_SYN_REQUESTED)
             if self.state == self.STATE_SYNACK_RECEIVED:
                 self.send_packet(self.PACKET_TYPE_ACK, b"")
@@ -192,14 +207,28 @@ class RDTOverUDP:
                     self.set_state(self.STATE_INIT)
                     retries += 1
 
-    def send_packet(self, packet_type, payload, final=0, use_tuple=False, no_increment=False):
-        if not no_increment:
-            self.seq_num += 1
-        print(f"Sending packet type {packet_type} with sequence {self.seq_num}, ack {self.ack_num}, final {final}, payload '{payload.decode()}'")
-        header = struct.pack(self.header_format, packet_type, self.seq_num, self.ack_num, final)
-        packet = header + payload
+    def send_packet(self, packet_type, payload, final=0, resend=False):
+        if self.awaiting_ack:
+            # Resend the cached packet
+            packet = self.cached_packet
+        else:
+            if not resend:
+                self.seq_num += 1
+            print(
+                f"Sending packet type {packet_type} with sequence {self.seq_num}, ack {self.ack_num}, final {final}, payload '{payload.decode()}'")
+            header = struct.pack(self.HEADER_FORMAT, packet_type, self.seq_num, self.ack_num, final)
+            packet = header + payload
+            # Cache the packet
+            self.cached_packet = packet
+
+        # Add unreliability for testing :evil:
+        if (packet_type == self.PACKET_TYPE_DATA or packet_type == self.PACKET_TYPE_ACK) and self.DROP_CHANCE > 0:
+            if random() < self.DROP_CHANCE:
+                print(f"(Dropped send)")
+                return
         # Send the packet using the UDP socket
-        if use_tuple:
+        # The sendto function has different requirements depending on client/server and location in code
+        if self.state == self.STATE_INIT:
             self.udp_socket.sendto(packet, (self.client_address, self.port))
         else:
             self.udp_socket.sendto(packet, self.client_address)
@@ -208,26 +237,35 @@ class RDTOverUDP:
         # Split the payload into smaller packets if necessary
         packets = self.split_payload(payload)
         sent = 0
+        # resend is used to set the no-increment flag when a packet is being resent, to avoid the auto-increment of the seq
         resend = False
         while sent < len(packets):
             if self.state == self.STATE_ESTABLISHED:
                 # Send the packet
                 if sent == len(packets) - 1:
-                    self.send_packet(self.PACKET_TYPE_DATA, packets[sent], self.FINAL_FLAG, no_increment=resend)
+                    self.send_packet(self.PACKET_TYPE_DATA, packets[sent], self.FINAL_FLAG, resend=resend)
                     self.final = True
                 else:
-                    self.send_packet(self.PACKET_TYPE_DATA, packets[sent], no_increment=resend)
-                # Wait for the ACK
-                packet_type, seq_num, ack_num, final, payload = self.wait_for_packet()
+                    self.send_packet(self.PACKET_TYPE_DATA, packets[sent], resend=resend)
+                # Wait for the ACK - The TIMEOUT parameter is used for triggering a resend on dropped packets
+                packet_type, seq_num, ack_num, final, payload = self.wait_for_packet(self.TIMEOUT)
 
                 # Check the ACK
-                if packet_type == self.PACKET_TYPE_ACK:
+                # Resend on dropped packets
+                if packet_type == self.PACKET_TYPE_NONE:
+                    print(f"Packet timed out -- resending")
+                    resend = True
+                elif packet_type == self.PACKET_TYPE_ACK:
                     if ack_num == self.seq_num + 1:
+                        # Good ack, increment to next packet
+                        resend = False
                         sent += 1
+                        # If that was the last packet, reset ack/seq values - an unnecessary choice on my part
                         if self.final:
                             self.do_reset()
                     else:
-                        print(f"ack:{ack_num} seq:{self.seq_num}")
+                        # resend on out-of-order packets
+                        print(f"Received ack:{ack_num}, but expected {self.seq_num + 1} -- resending")
                         resend = True
             else:
                 # Auto-reconnect
@@ -236,8 +274,8 @@ class RDTOverUDP:
 
     def split_payload(self, payload):
         packets = []
-        for i in range(0, len(payload), self.send_byte_size):
-            packets.append(payload[i:i + self.send_byte_size])
+        for i in range(0, len(payload), self.SEND_BYTE_SIZE):
+            packets.append(payload[i:i + self.SEND_BYTE_SIZE])
         return packets
 
     # This is only going to work if the other end is actively listening...
