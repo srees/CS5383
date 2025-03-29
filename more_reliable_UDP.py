@@ -20,9 +20,10 @@ class RDTOverUDP:
     PACKET_TYPE_NONE = 0xFF
 
     # Header info
-    MORE_FLAG = 0x00
-    FINAL_FLAG = 0x01
-    HEADER_FORMAT = "!BIIB"
+    DISABLE_FLAG = 0x00
+    ENABLE_FLAG = 0x01
+
+    HEADER_FORMAT = "!BIIBB"
     HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
     # Server states
@@ -45,8 +46,12 @@ class RDTOverUDP:
     CONNECT_RETRY = 3
     UDP_BUFFER = 1024
     SEND_BYTE_SIZE = 8
+    # how long we listen before timing out and resending
     TIMEOUT = 1.0
-    DROP_CHANCE = 0.3
+    # likelihood of a packet drop happening (affects data and ack packets)
+    DROP_CHANCE = 0.25
+    # TIMEOUT multiplier when switching roles between send/receive
+    COOLDOWN_MULTIPLIER = 3
 
     # Initialize variables on creation
     def __init__(self, host, port):
@@ -78,7 +83,7 @@ class RDTOverUDP:
         while not self.state == self.STATE_ESTABLISHED and not retries == self.CONNECT_RETRY:
 
             # Wait for packet
-            packet_type, seq_num, ack_num, final, payload = self.rdt_wait_for_packet()
+            packet_type, seq_num, ack_num, final, resent, payload = self.rdt_wait_for_packet()
 
             # If we receive a reset, it's handled the same regardless of state
             if packet_type == self.PACKET_TYPE_RESET:
@@ -135,7 +140,7 @@ class RDTOverUDP:
 
             # Listen for response and update state
             if self.state == self.STATE_SYN_REQUESTED:
-                packet_type, seq_num, ack_num, final, payload = self.rdt_wait_for_packet()
+                packet_type, seq_num, ack_num, final, resent, payload = self.rdt_wait_for_packet()
                 # Receive options
                 if packet_type == self.PACKET_TYPE_SYNACK and ack_num == self.seq_num + 1:
                     # Handshake complete, move on!
@@ -156,7 +161,7 @@ class RDTOverUDP:
         while self.state != self.STATE_CLOSED:
             self.set_state(self.STATE_CLOSE_WAIT)
             self.rdt_send_packet(self.PACKET_TYPE_DISCONNECT, b"")
-            packet_type, seq_num, ack_num, final, payload = self.rdt_wait_for_packet()
+            packet_type, seq_num, ack_num, final, resent, payload = self.rdt_wait_for_packet()
             if packet_type == self.PACKET_TYPE_DISCONNECT_ACK:
                 self.set_state(self.STATE_CLOSED)
         self.udp_socket.close()
@@ -176,7 +181,7 @@ class RDTOverUDP:
         while not self.final and not self.state == self.STATE_CLOSED:
 
             # Get a packet
-            packet_type, seq_num, ack_num, final, payload = self.rdt_wait_for_packet()
+            packet_type, seq_num, ack_num, final, resent, payload = self.rdt_wait_for_packet()
 
             # State machine handling
             if self.state == self.STATE_ESTABLISHED:
@@ -188,10 +193,19 @@ class RDTOverUDP:
                         # Buffer the data
                         buffer += payload
                         # Set variable to break out of while loop and return data to caller
-                        if final == self.FINAL_FLAG:
+                        if final == self.ENABLE_FLAG:
                             self.final = 1
                         # Send ack (this will be a re-ack for the previous packet if the numbers don't match)
                         self.rdt_send_packet(self.PACKET_TYPE_ACK, b"", final=self.final)
+
+                        # Allow a cooldown period on final in case the sender does not receive ack, where it can retry
+                        # Note this can still fail if the sender has enough repeated dropped packets
+                        if self.final == 1:
+                            while packet_type != self.PACKET_TYPE_NONE:
+                                print("Cooldown...")
+                                packet_type, seq_num, ack_num, final, resent, payload = self.rdt_wait_for_packet(self.TIMEOUT * self.COOLDOWN_MULTIPLIER)
+                                if packet_type == self.PACKET_TYPE_DATA:
+                                    self.rdt_send_packet(self.PACKET_TYPE_ACK, b"", final=self.final)
                     else:
                         # If the seq is wrong, our ack may have timed out - resend
                         self.rdt_send_packet(self.PACKET_TYPE_ACK, b"",resend=True)
@@ -226,15 +240,15 @@ class RDTOverUDP:
     def rdt_wait_for_packet(self, timeout=None):
         data = self.wait_for_packet(timeout)
         if data is None:
-            return self.PACKET_TYPE_NONE, 0, 0, 0, b""
+            return self.PACKET_TYPE_NONE, 0, 0, 0, b"", self.DISABLE_FLAG
         else:
             # Split out and parse header
             header = data[:self.HEADER_SIZE]
             payload = data[self.HEADER_SIZE:]
-            packet_type, seq_num, ack_num, final = struct.unpack(self.HEADER_FORMAT, header)
+            packet_type, seq_num, ack_num, final, resent = struct.unpack(self.HEADER_FORMAT, header)
             print(
                 f"Received packet type {packet_type} with sequence {seq_num}, ack {ack_num}, final {final}, payload '{payload.decode()}'")
-            return packet_type, seq_num, ack_num, final, payload
+            return packet_type, seq_num, ack_num, final, resent, payload
 
     # The reliable send function handles FSM states from ESTABLISHED to CLOSED
     def rdt_send(self, payload):
@@ -248,12 +262,12 @@ class RDTOverUDP:
             if self.state == self.STATE_ESTABLISHED:
                 # Send the packet
                 if sent == len(packets) - 1:
-                    self.rdt_send_packet(self.PACKET_TYPE_DATA, packets[sent], self.FINAL_FLAG, resend=resend)
+                    self.rdt_send_packet(self.PACKET_TYPE_DATA, packets[sent], self.ENABLE_FLAG, resend=resend)
                     self.final = 1
                 else:
                     self.rdt_send_packet(self.PACKET_TYPE_DATA, packets[sent], resend=resend)
                 # Wait for the ACK - The TIMEOUT parameter is used for triggering a resend on dropped packets
-                packet_type, seq_num, ack_num, final, payload = self.rdt_wait_for_packet(self.TIMEOUT)
+                packet_type, seq_num, ack_num, final, resent, payload = self.rdt_wait_for_packet(self.TIMEOUT)
 
                 # Check the ACK
                 # Resend on dropped packets
@@ -273,12 +287,6 @@ class RDTOverUDP:
                         # resend on out-of-order packets
                         print(f"Received ack:{ack_num}, but expected {self.seq_num + 1} -- resending")
                         resend = True
-                elif packet_type == self.PACKET_TYPE_DATA:
-                    print(f"self ack: {self.ack_num} seq: {seq_num}")
-                    if self.ack_num == (seq_num + 1):
-                        # We have already seen this, ack it
-                        self.rdt_send_packet(self.PACKET_TYPE_ACK, b"", ack_num=self.ack_num, seq_num=seq_num)
-                        resend = True
             else:
                 # Auto-reconnect
                 self.rdt_client_connect()
@@ -288,7 +296,7 @@ class RDTOverUDP:
         # The only time we override seq_num and ack_num are for a special case where we are just giving a blanket re-ack
         # for a packet we already moved past
         if seq_num is not None and ack_num is not None:
-             header = struct.pack(self.HEADER_FORMAT, packet_type, seq_num, ack_num, final)
+             header = struct.pack(self.HEADER_FORMAT, packet_type, seq_num, ack_num, self.ENABLE_FLAG if final else self.DISABLE_FLAG, self.ENABLE_FLAG if resend else self.DISABLE_FLAG)
              packet = header + payload
              self.send_packet(packet, dropchance=packet_type in (self.PACKET_TYPE_DATA, self.PACKET_TYPE_ACK))
              return
@@ -297,14 +305,18 @@ class RDTOverUDP:
             packet = self.cached_packet
             header = packet[:self.HEADER_SIZE]
             payload = packet[self.HEADER_SIZE:]
-            packet_type, seq_num, ack_num, final = struct.unpack(self.HEADER_FORMAT, header)
+            packet_type, seq_num, ack_num, final, resent = struct.unpack(self.HEADER_FORMAT, header)
+            # Rebuild packet with resent flag ON
+            resent = self.ENABLE_FLAG
+            header = struct.pack(self.HEADER_FORMAT, packet_type, seq_num, ack_num, final, resent)
+            packet = header + payload
             print(
                 f"Resending packet type {packet_type} with sequence {self.seq_num}, ack {self.ack_num}, final {final}, payload '{payload.decode()}'")
         else:
             self.seq_num += 1
             print(
                 f"Sending packet type {packet_type} with sequence {self.seq_num}, ack {self.ack_num}, final {final}, payload '{payload.decode()}'")
-            header = struct.pack(self.HEADER_FORMAT, packet_type, self.seq_num, self.ack_num, final)
+            header = struct.pack(self.HEADER_FORMAT, packet_type, self.seq_num, self.ack_num, self.ENABLE_FLAG if final else self.DISABLE_FLAG, self.ENABLE_FLAG if resend else self.DISABLE_FLAG)
             packet = header + payload
             # Cache the packet
             self.cached_packet = packet
